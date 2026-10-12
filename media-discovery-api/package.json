@@ -1,0 +1,20 @@
+
+{
+  "name": "media-discovery-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A media URL discovery API for Render",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "express": "^5.1.0",
+    "ipaddr.js": "^2.2.0"
+  }
+}
