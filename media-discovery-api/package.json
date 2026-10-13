@@ -1,13 +1,13 @@
-
 {
-  "name": "media-discovery-api",
-  "version": "1.0.0",
+  "name": "vid-sniffer",
+  "version": "2.0.0",
   "private": true,
-  "description": "A media URL discovery API for Render",
+  "description": "Industrial-grade video URL sniffer API for Render — extracts m3u8/mp4/mkv/ts/webm/mpd streams from any page, with Cloudflare Turnstile solving (cloudflare-turnstile-bypass / Peak protocol).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node --test test/"
   },
   "engines": {
     "node": ">=20"

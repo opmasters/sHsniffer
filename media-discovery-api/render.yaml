@@ -1,11 +1,19 @@
 services:
   - type: web
-    name: media-discovery-api
+    name: vid-sniffer
     runtime: node
     plan: free
-    buildCommand: npm install
+    region: singapore
+    buildCommand: npm install --omit=dev
     startCommand: npm start
     healthCheckPath: /health
+    autoDeploy: true
     envVars:
       - key: NODE_ENV
         value: production
+      # Optional: set these in the Render dashboard (secret) to enable
+      # automatic Cloudflare Turnstile bypass on protected hosts.
+      - key: PEAK_API_KEY
+        sync: false
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "30"
