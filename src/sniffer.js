@@ -4,12 +4,24 @@
  * The sniffing engine: BFS crawl of a page + its player iframes, resolving
  * HLS/DASH master playlists into renditions, auto-solving Cloudflare
  * Turnstile gates, all under one global time budget with request dedupe.
+ *
+ * m3u8Sniffer2-inspired additions (github.com/Leenshady/m3u8Sniffer2):
+ *   - passive "wait window": keep polling discovered endpoints for up to
+ *     WAIT_MS (default 20s) so lazily-fired manifests show up before we give
+ *     an answer — like watching webRequest traffic in the extension,
+ *   - per-stream `headers` (Referer/Origin/User-Agent) recorded so consumers
+ *   can replay requests that are hotlink-protected,
+ *   - query-stripped dedupe ledger so token-refresh duplicates of the same
+ *     manifest collapse into one entry,
+ *   - results returned as JSON sorted by quality (best rendition first).
  */
 
 const config = require("./config");
 const { safeFetch, readLimited, HttpError, CookieJar } = require("./http-client");
 const { extractFromDocument, MEDIA_EXT_RE, PLAYLIST_TYPES, classifyMediaType } = require("./extractors");
 const turnstile = require("./turnstile");
+const quality = require("./quality");
+const { waitForMedia, SniffLedger, sleep } = require("./net-probe");
 
 class SniffError extends Error {
   constructor(message, statusCode = 502) {
@@ -64,9 +76,13 @@ function parseM3u8(text, baseUrl) {
           const res = /RESOLUTION=(\d+x\d+)/i.exec(attrs);
           const bw = /BANDWIDTH=(\d+)/i.exec(attrs);
           const codeps = /CODECS="([^"]+)"/i.exec(attrs);
+          const fr = /FRAME-RATE=([\d.]+)/i.exec(attrs);
+          const name = /NAME="([^"]+)"/i.exec(attrs);
           if (res) meta.resolution = res[1];
           if (bw) meta.bandwidth = Number(bw[1]);
           if (codeps) meta.codecs = codeps[1];
+          if (fr) meta.frameRate = parseFloat(fr[1]);
+          if (name) meta.streamName = name[1];
           meta.type = "hls-rendition";
           break;
         }
@@ -91,6 +107,27 @@ function parseDash(text, baseUrl) {
       out.push({ url: new URL(m[1], baseUrl).href, type: "dash-rendition" });
     } catch { /* ignore */ }
   }
+  // <Representation width= height= bandwidth= frameRate=> — real quality data.
+  for (const m of text.matchAll(/<Representation\b([^>]*)>/gi)) {
+    const attrs = m[1];
+    const get = (name) => {
+      const mm = new RegExp(`${name}\\s*=\\s*"([^"]+)"`, "i").exec(attrs);
+      return mm ? mm[1] : undefined;
+    };
+    const item = { type: "dash-rendition" };
+    const w = get("width");
+    const h = get("height");
+    if (w && h) item.resolution = `${w}x${h}`;
+    else if (h) item.resolution = `x${h}`;
+    if (get("bandwidth")) item.bandwidth = Number(get("bandwidth"));
+    if (get("frameRate")) item.frameRate = parseFloat(String(get("frameRate")).replace("/", "."));
+    if (get("codecs")) item.codecs = get("codecs");
+    const baseUrlTag = /<BaseURL\s*>\s*([^<]+?)\s*<\/BaseURL>/i.exec(attrs);
+    try {
+      item.url = new URL(baseUrlTag ? baseUrlTag[1].trim() : baseUrl, baseUrl).href;
+      out.push(item);
+    } catch { /* ignore */ }
+  }
   return out;
 }
 
@@ -105,12 +142,38 @@ async function sniff(targetUrl, options = {}) {
 
   const media = new Map();   // url -> {url,type,source,...}
   const notes = [];
+  const ledger = new SniffLedger(); // m3u8Sniffer2-style deduped request log
   let turnstileSolved = false;
 
   const addMedia = (item) => {
     if (!item?.url) return;
     if (media.size >= config.maxResults) return;
-    if (!media.has(item.url)) media.set(item.url, item);
+    if (!media.has(item.url)) {
+      media.set(item.url, item);
+      ledger.add(item.url, { type: item.type });
+    } else if (item.quality && !media.get(item.url).quality) {
+      // Later playlist metadata enriches an earlier bare sighting.
+      media.set(item.url, { ...media.get(item.url), ...item });
+    }
+  };
+
+  /**
+   * Hotlink-protection helper (m3u8Sniffer2 users learn quickly that raw
+   * manifest urls often 403 without the right headers): record the page URL
+   * each stream was discovered from so we can emit ready-to-use request
+   * headers per result.
+   */
+  const requiredHeadersFor = (pageUrl) => {
+    try {
+      const u = new URL(pageUrl);
+      return {
+        "User-Agent": config.userAgent,
+        Referer: pageUrl,
+        Origin: `${u.protocol}//${u.host}`,
+      };
+    } catch {
+      return undefined;
+    }
   };
 
   async function fetchDoc(url, depth) {
@@ -201,10 +264,61 @@ async function sniff(targetUrl, options = {}) {
     }
   }
 
+  /**
+   * Passive-capture poll round (m3u8Sniffer2's webRequest watcher, server
+   * side): re-fetch known playlists and player-API candidates inside the
+   * wait window. Hosts that only emit their real manifest after a token
+   * handshake or on second request get caught here. New urls flow into the
+   * shared `media` map via addMedia(), which grows `ledger.size` — the
+   * signal waitForMedia() watches.
+   */
+  async function pollRound(candidates) {
+    if (Date.now() > deadlineAt) return;
+    await pool(candidates, async (p) => {
+      try {
+        const { response, url: finalUrl } = await safeFetch(p.url, { jar, deadlineAt });
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => {});
+          return;
+        }
+        const contentType = (response.headers.get("content-type") || "").toLowerCase();
+        const text = await readLimited(response, 512 * 1024);
+        const looksJson = contentType.includes("json") || /^\s*[{[]/.test(text);
+
+        if (/mpegurl|dash/i.test(contentType) || /\.(m3u8|mpd)(\?|$)/i.test(finalUrl.pathname)) {
+          const renditions = /\.mpd/i.test(finalUrl.pathname)
+            ? parseDash(text, finalUrl.href)
+            : parseM3u8(text, finalUrl.href);
+          for (const r of renditions) {
+            addMedia({ ...r, source: `${p.source}>poll`, viaMaster: p.url, depth: p.depth ?? 0, discoveredViaPoll: true });
+          }
+        } else if (looksJson || contentType.includes("json")) {
+          try {
+            const found = extractFromDocument(text, finalUrl.href).media;
+            for (const item of found.values()) {
+              addMedia({ ...item, depth: p.depth ?? 0, discoveredViaPoll: true });
+              if (/\.(m3u8|mpd)($|[?#])/i.test(item.url) && !pollTargets.has(item.url)) {
+                pollTargets.set(item.url, { url: item.url, source: "poll-discovered", depth: p.depth ?? 0 });
+              }
+            }
+          } catch { /* non-JSON body, ignore */ }
+        } else {
+          // HTML/JS response — run the full static extractor over it.
+          const found = extractFromDocument(text, finalUrl.href).media;
+          for (const item of found.values()) {
+            addMedia({ ...item, depth: p.depth ?? 0, discoveredViaPoll: true });
+          }
+        }
+      } catch { /* transient poll failures are fine; next round retries */ }
+    }, Math.min(config.concurrency, 4));
+  }
+
   // --- BFS over documents ---------------------------------------------------
   const queue = [{ url: targetUrl, depth: 0 }];
   visited.add(targetUrl);
   const playlistJobs = [];
+  // Rolling set of endpoints polled during the passive-capture wait window.
+  const pollTargets = new Map();
 
   while (queue.length) {
     const batch = queue.splice(0, config.concurrency);
@@ -250,8 +364,61 @@ async function sniff(targetUrl, options = {}) {
   const uniquePlaylists = [...new Map(playlistJobs.map((p) => [p.url, p])).values()].slice(0, 20);
   await pool(uniquePlaylists, async (p) => handlePlaylist(p.url, p.source, p.depth ?? 0));
 
+  // --- Passive-capture wait window (up to WAIT_MS / 20s by default) ---------
+  // Like the extension watching webRequest traffic: keep polling until either
+  // new streams stop arriving (settle) or the wait budget runs out. Skipped
+  // when `wait: false` is passed (e.g. warm cache refreshes) and shortened
+  // automatically if we already have results and the caller opted into a
+  // quick answer (`options.waitMs`).
+  for (const p of uniquePlaylists) {
+    pollTargets.set(p.url, { url: p.url, source: p.source || "page", depth: p.depth ?? 0 });
+  }
+
+  const waitEnabled = options.wait !== false && config.waitMs > 0;
+  let waitedMs = 0;
+  // Poll when we have endpoints to re-check, or when nothing was found yet
+  // (give lazily-generated streams the full grace period either way).
+  if (waitEnabled && (pollTargets.size > 0 || ledger.size === 0)) {
+    const baseline = ledger.size;
+    const wait = await waitForMedia(
+      async () => {
+        await pollRound([...pollTargets.values()].slice(0, 12));
+        return ledger.size;
+      },
+      {
+        waitMs: Math.min(options.waitMs ?? config.waitMs, Math.max(0, deadlineAt - Date.now())),
+        deadlineAt,
+      }
+    );
+    waitedMs = wait.waitedMs;
+    if (ledger.size > baseline) {
+      notes.push(`Wait window captured ${ledger.size - baseline} additional stream(s).`);
+      // One final resolve pass so newly surfaced masters get renditions too.
+      const fresh = [...media.values()].filter(
+        (m) => /\.(m3u8|mpd)($|[?#])/i.test(m.url) && !m.renditionCount && !pollTargets.has(m.url)
+      );
+      if (fresh.length) {
+        for (const f of fresh) pollTargets.set(f.url, { url: f.url, source: f.source, depth: f.depth ?? 0 });
+        await pool(fresh.slice(0, 10), async (p) => handlePlaylist(p.url, p.source, p.depth ?? 0));
+      }
+    }
+  }
+
+  // --- Quality annotation + JSON sorted by quality ---------------------------
+  const pageHeaders = requiredHeadersFor(targetUrl);
   const results = [...media.values()]
-    .sort((a, b) => rank(a) - rank(b))
+    .map((item) => {
+      quality.applyQuality(item, {
+        resolution: item.resolution,
+        bandwidth: item.bandwidth,
+        codecs: item.codecs,
+        frameRate: item.frameRate,
+      });
+      if (item.streamName && item.quality) item.quality.name = item.streamName;
+      if (pageHeaders) item.headers = pageHeaders; // replay headers for hotlink-protected streams
+      return item;
+    })
+    .sort((a, b) => quality.compareResults(a, b, rank))
     .slice(0, config.maxResults);
 
   return {
@@ -259,7 +426,10 @@ async function sniff(targetUrl, options = {}) {
     notes,
     stats: {
       durationMs: Date.now() - startedAt,
+      waitMs: waitedMs,
       pagesVisited: visited.size,
+      uniqueRequestsLogged: ledger.size,
+      m3u8Captured: ledger.countMatching(/\.m3u8?$/i),
       turnstileSolved,
     },
   };
@@ -278,3 +448,4 @@ function rank(item) {
 }
 
 module.exports = { sniff, parseM3u8, parseDash, rank };
+

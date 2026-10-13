@@ -134,7 +134,22 @@ async function runSniff(req, res) {
     return res.status(error.statusCode || 400).json({ error: error.message });
   }
 
-  const cacheKey = target.href;
+  // Caller-tunable wait window ("allow wait time of up to 20s to grab the url"):
+  //   ?wait=0     -> skip the passive-capture polling entirely
+  //   ?wait=8000  -> cap it at 8s
+  // default is config.waitMs (20s), hard-capped at 20s so nobody can park a
+  // request longer than the agreed budget.
+  const rawWait = req.query.wait ?? req.query.timeout;
+  let waitMs;
+  if (rawWait !== undefined) {
+    const parsed = Number(rawWait);
+    waitMs = Number.isFinite(parsed) ? Math.max(0, Math.min(parsed, 20_000)) : undefined;
+  }
+  const sniffOptions = {};
+  if (waitMs !== undefined) sniffOptions.waitMs = waitMs;
+  if (waitMs === 0) sniffOptions.wait = false;
+
+  const cacheKey = `${target.href}|${waitMs ?? "d"}`;
   const cached = cacheGet(cacheKey);
   if (cached) {
     res.set("X-Cache", "HIT");
@@ -143,12 +158,13 @@ async function runSniff(req, res) {
   res.set("X-Cache", "MISS");
 
   try {
-    const outcome = await coalescedSniff(cacheKey, target);
+    const outcome = await coalescedSniff(cacheKey, target, sniffOptions);
     const payload = {
       source: target.href,
       count: outcome.results.length,
       primary: outcome.results[0] || null,
-      results: outcome.results,
+      best: pickBest(outcome.results),
+      results: outcome.results, // sorted by quality (best first)
       stats: outcome.stats,
       notes: outcome.notes,
       generatedAt: new Date().toISOString(),
@@ -160,6 +176,24 @@ async function runSniff(req, res) {
     if (status >= 500) cacheSet(cacheKey, { error: error.message }, true);
     return res.status(status).json({ error: error.message || "Sniff failed." });
   }
+}
+
+/**
+ * Condensed "best stream" summary — take results[0] among genuinely playable
+ * entries and surface its quality + the headers needed to fetch it without a
+ * 403 (hotlink protection), m3u8Sniffer2-style but ready for direct use.
+ */
+function pickBest(results) {
+  if (!results?.length) return null;
+  const best = results[0];
+  return {
+    url: best.url,
+    type: best.type,
+    quality: best.quality
+      ? { label: best.quality.label, height: best.quality.height ?? null, bandwidth: best.quality.bandwidth ?? null }
+      : null,
+    headers: best.headers ?? null,
+  };
 }
 
 // JSON API — the main entry point.
