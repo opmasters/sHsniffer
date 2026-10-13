@@ -22,12 +22,19 @@ const config = {
 
   // ---- Fetch budget -------------------------------------------------------
   maxBytes: num("MAX_BYTES", 4 * 1024 * 1024),        // per-document inspection cap
-  timeoutMs: num("TIMEOUT_MS", 12_000),               // per-request deadline
-  totalBudgetMs: num("TOTAL_BUDGET_MS", 30_000),      // whole-sniff deadline
+  timeoutMs: num("TIMEOUT_MS", 20_000),               // per-request deadline (up to 20s to grab the url)
+  totalBudgetMs: num("TOTAL_BUDGET_MS", 45_000),      // whole-sniff deadline
   maxRedirects: num("MAX_REDIRECTS", 6),
   maxDepth: num("MAX_DEPTH", 2),                      // nested iframe/player recursion
   maxResults: num("MAX_RESULTS", 200),
   concurrency: num("CONCURRENCY", 6),                 // parallel candidate fetches
+
+  // ---- Wait / passive-capture window -------------------------------------
+  // How long we let the page "breathe" so lazily-triggered stream requests
+  // (hls.js, dash.js, XHR manifests fired after load) get captured.
+  waitMs: num("WAIT_MS", 20_000),                     // up to 20s to grab the url
+  pollIntervalMs: num("POLL_INTERVAL_MS", 750),       // early-exit polling cadence
+  settleAfterMs: num("SETTLE_AFTER_MS", 2_500),       // stop waiting once no new urls appear for this long
 
   // ---- Cache --------------------------------------------------------------
   cacheTtlMs: num("CACHE_TTL_MS", 60_000),
