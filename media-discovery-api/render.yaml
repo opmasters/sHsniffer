@@ -3,7 +3,7 @@ services:
     name: vid-sniffer
     runtime: node
     plan: free
-    region: singapore
+    region: virginia
     buildCommand: npm install --omit=dev
     startCommand: npm start
     healthCheckPath: /health
